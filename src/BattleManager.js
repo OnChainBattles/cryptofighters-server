@@ -380,27 +380,45 @@ class BattleManager {
   handleTurnTimeout(battle) {
     console.log(`[BATTLE] Turn ${battle.turnNumber} timeout for ${battle.lobbyId}`);
 
-    if (!battle.creator.pendingMove) {
+    const creatorMissed = !battle.creator.pendingMove;
+    const opponentMissed = !battle.opponent.pendingMove;
+
+    if (creatorMissed) {
       battle.creator.missedTurns++;
       console.log(`[BATTLE] Creator missed turn (${battle.creator.missedTurns}/${MAX_MISSED_TURNS})`);
-
-      if (battle.creator.missedTurns >= MAX_MISSED_TURNS) {
-        this.endBattle(battle, battle.opponent.wallet, 'timeout_forfeit');
-        return;
-      }
-
-      battle.creator.pendingMove = { type: 'move', moveIndex: 0, auto: true };
     }
 
-    if (!battle.opponent.pendingMove) {
+    if (opponentMissed) {
       battle.opponent.missedTurns++;
       console.log(`[BATTLE] Opponent missed turn (${battle.opponent.missedTurns}/${MAX_MISSED_TURNS})`);
+    }
 
-      if (battle.opponent.missedTurns >= MAX_MISSED_TURNS) {
-        this.endBattle(battle, battle.creator.wallet, 'timeout_forfeit');
-        return;
-      }
+    // Check forfeits AFTER counting both - check both-AFK fairly
+    const creatorForfeited = battle.creator.missedTurns >= MAX_MISSED_TURNS;
+    const opponentForfeited = battle.opponent.missedTurns >= MAX_MISSED_TURNS;
 
+    if (creatorForfeited && opponentForfeited) {
+      // Both AFK - higher total HP wins, creator wins ties
+      const creatorHp = battle.creator.team.reduce((sum, f) => sum + f.currentHp, 0);
+      const opponentHp = battle.opponent.team.reduce((sum, f) => sum + f.currentHp, 0);
+      const winner = creatorHp >= opponentHp ? battle.creator.wallet : battle.opponent.wallet;
+      this.endBattle(battle, winner, 'both_timeout');
+      return;
+    }
+    if (creatorForfeited) {
+      this.endBattle(battle, battle.opponent.wallet, 'timeout_forfeit');
+      return;
+    }
+    if (opponentForfeited) {
+      this.endBattle(battle, battle.creator.wallet, 'timeout_forfeit');
+      return;
+    }
+
+    // Auto-move for anyone who missed
+    if (creatorMissed) {
+      battle.creator.pendingMove = { type: 'move', moveIndex: 0, auto: true };
+    }
+    if (opponentMissed) {
       battle.opponent.pendingMove = { type: 'move', moveIndex: 0, auto: true };
     }
 
@@ -685,6 +703,13 @@ class BattleManager {
       return;
     }
 
+    // Clear stat stages on the outgoing fighter
+    const outgoing = player.team[player.activeFighterIndex];
+    if (outgoing) {
+      outgoing.statStages = { attack: 0, defense: 0, spAttack: 0, spDefense: 0, speed: 0 };
+      outgoing.lastMoveWasProtect = false;
+    }
+
     // Perform the switch
     const oldIndex = player.activeFighterIndex;
     player.activeFighterIndex = fighterIndex;
@@ -895,19 +920,21 @@ class BattleManager {
     if (battle.turnTimerPaused) {
       battle.turnTimerPaused = false;
       // DON'T call startTurn() - that resets BOTH players' pendingMove
-      // Instead restart the timer and send turn_start only to the reconnecting player
+      // Instead restart the timer with REMAINING time, not full timer
+      const elapsed = Date.now() - (battle.turnStartTime || Date.now());
+      const remaining = Math.max(5000, TURN_TIMEOUT - elapsed); // at least 5 seconds
       battle.turnTimer = setTimeout(() => {
         this.handleTurnTimeout(battle);
-      }, TURN_TIMEOUT);
+      }, remaining);
       const playerSocket = this.io.sockets.sockets.get(player.socketId);
       if (playerSocket) {
         playerSocket.emit('turn_start', {
           turnNumber: battle.turnNumber,
           myState: battle.getStateForPlayer(walletAddress),
-          timeLimit: TURN_TIMEOUT
+          timeLimit: remaining
         });
       }
-      console.log(`[BATTLE] Turn timer resumed (without resetting moves)`);
+      console.log(`[BATTLE] Turn timer resumed with ${Math.round(remaining/1000)}s remaining (without resetting moves)`);
 
       // If both moves are now ready (opponent submitted while disconnected), process immediately
       if (battle.bothMovesReady()) {

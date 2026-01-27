@@ -109,7 +109,7 @@ app.post('/player/:wallet', (req, res) => {
   }
 
   try {
-    const allowedFields = ['displayName', 'teams', 'colorPalette', 'settings', 'stats'];
+    const allowedFields = ['displayName', 'teams', 'colorPalette', 'settings'];
     const filteredSettings = {};
 
     for (const key of allowedFields) {
@@ -226,7 +226,13 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const { lobbyName, wagerAmount, team, onChainLobbyId } = data;
+    let { lobbyName, wagerAmount, team, onChainLobbyId } = data;
+
+    // Sanitize lobby name: must be string, max 50 chars, strip HTML
+    if (typeof lobbyName === 'string') {
+      lobbyName = lobbyName.replace(/<[^>]*>/g, '').trim().slice(0, 50);
+    }
+
     console.log(`[LOBBY] Data: name=${lobbyName}, wager=${wagerAmount}, onChainId=${onChainLobbyId}, teamSize=${team?.length}`);
 
     if (!lobbyName || !wagerAmount || !team) {

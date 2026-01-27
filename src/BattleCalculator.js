@@ -258,6 +258,7 @@ const STAT_DROP_MOVES = {
   'Overheat': { changes: { spAttack: -2 } },        // Overheat lowers user SpAtk by 2
   'Power Brawl': { changes: { defense: -1, spDefense: -1 } }, // Close Combat
   'Hammer Arm': { changes: { speed: -1 } },          // Hammer Arm lowers speed
+  'Yield Storm': { changes: { spAttack: -2 } },      // Leaf Storm lowers user SpAtk by 2
 };
 
 // ============================================
@@ -269,6 +270,7 @@ const RECOIL_MOVES = {
   'Pump Blitz': 0.33,     // Flare Blitz
   'Crash Down': 0.33,     // Brave Bird
   'Head Smash': 0.50,     // 50% recoil
+  'Yield Hammer': 0.33,   // Wood Hammer - 33% recoil
 };
 
 // Explosion: KO self after dealing damage
@@ -289,6 +291,8 @@ const SELF_HEAL_MOVES = {
   'Deep Chill': 0.50,     // Roost - heal 50% max HP
   'Chill Perch': 0.50,    // Also Roost
   'Wish Pump': 0.50,      // Simplified Wish - instant 50% heal
+  'HODL Fork': 0.50,      // Recover - heal 50% max HP
+  'Egg Fork': 0.50,       // Soft-Boiled - heal 50% max HP
 };
 
 // ============================================
@@ -481,8 +485,12 @@ function determineOrder(move1, fighter1, move2, fighter2) {
     return priority1 > priority2 ? 'first' : 'second';
   }
 
-  const speed1 = fighter1.stats.speed * getStatStageMultiplier(fighter1.statStages?.speed || 0);
-  const speed2 = fighter2.stats.speed * getStatStageMultiplier(fighter2.statStages?.speed || 0);
+  let speed1 = fighter1.stats.speed * getStatStageMultiplier(fighter1.statStages?.speed || 0);
+  let speed2 = fighter2.stats.speed * getStatStageMultiplier(fighter2.statStages?.speed || 0);
+
+  // Paralysis reduces speed to 25%
+  if (fighter1.status === 'paralyzed') speed1 *= 0.25;
+  if (fighter2.status === 'paralyzed') speed2 *= 0.25;
 
   if (speed1 !== speed2) {
     return speed1 > speed2 ? 'first' : 'second';
@@ -507,8 +515,13 @@ function processTurn(creatorData, opponentData) {
   if (creatorFighterForReset) creatorFighterForReset.isProtected = false;
   if (opponentFighterForReset) opponentFighterForReset.isProtected = false;
 
-  // Handle switches first
+  // Handle switches first (clear stat stages on switch-out)
   if (creatorData.move.type === 'switch') {
+    const outgoing = creatorData.team[creatorData.player.activeFighterIndex];
+    if (outgoing) {
+      outgoing.statStages = { attack: 0, defense: 0, spAttack: 0, spDefense: 0, speed: 0 };
+      outgoing.lastMoveWasProtect = false;
+    }
     creatorData.player.activeFighterIndex = creatorData.move.fighterIndex;
     result.actions.push({
       player: 'creator',
@@ -519,6 +532,11 @@ function processTurn(creatorData, opponentData) {
   }
 
   if (opponentData.move.type === 'switch') {
+    const outgoing = opponentData.team[opponentData.player.activeFighterIndex];
+    if (outgoing) {
+      outgoing.statStages = { attack: 0, defense: 0, spAttack: 0, spDefense: 0, speed: 0 };
+      outgoing.lastMoveWasProtect = false;
+    }
     opponentData.player.activeFighterIndex = opponentData.move.fighterIndex;
     result.actions.push({
       player: 'opponent',
@@ -673,10 +691,32 @@ function executeAttack(attackerLabel, attacker, move, defender, result) {
     };
   }
 
+  // --- TAUNT CHECK: taunted fighters can't use status moves ---
+  if ((moveData.damageClass === 'status' || moveData.power === 0) && attacker.taunted && attacker.taunted > 0) {
+    console.log(`[BATTLE] ${attacker.name || attackerLabel} is taunted - ${moveData.name} failed!`);
+    return {
+      player: attackerLabel,
+      type: 'attack',
+      move: moveData.name,
+      moveType: moveData.type,
+      damage: 0,
+      effectiveness: 1,
+      isCrit: false,
+      targetHpRemaining: defender.currentHp,
+      targetFainted: false,
+      statusApplied: null,
+      failed: true,
+      taunted: true
+    };
+  }
+
   // --- STATUS MOVE HANDLING (stat boosts, heals, protect) ---
   if (moveData.damageClass === 'status' || moveData.power === 0) {
     return executeStatusMove(attackerLabel, attacker, defender, moveData);
   }
+
+  // Damaging move used - reset consecutive protect tracking
+  attacker.lastMoveWasProtect = false;
 
   // --- ACCURACY CHECK ---
   const accuracy = moveData.accuracy || 100;
@@ -695,8 +735,17 @@ function executeAttack(attackerLabel, attacker, move, defender, result) {
   // --- FIXED DAMAGE MOVES ---
   let damage, effectiveness, isCrit;
   if (FIXED_DAMAGE_MOVES.includes(moveData.name)) {
+    // Check type immunity before applying fixed damage
+    const typeEff = getTypeEffectiveness(moveData.type, defender.types || []);
+    if (typeEff === 0) {
+      return {
+        player: attackerLabel, type: 'attack', move: moveData.name, moveType: moveData.type,
+        damage: 0, effectiveness: 0, isCrit: false,
+        targetHpRemaining: defender.currentHp, targetFainted: false, statusApplied: null
+      };
+    }
     damage = 100;
-    effectiveness = 1;
+    effectiveness = 1; // Fixed damage ignores super-effective/resist, just not immunity
     isCrit = false;
   } else {
     ({ damage, effectiveness, isCrit } = calculateDamage(attacker, defender, moveData));
@@ -824,6 +873,23 @@ function executeStatusMove(attackerLabel, attacker, defender, moveData) {
     failed: false
   };
 
+  // --- ACCURACY CHECK for status moves ---
+  const accuracy = moveData.accuracy || 100;
+  if (accuracy < 100) {
+    const hits = Math.random() * 100 < accuracy;
+    if (!hits) {
+      console.log(`[BATTLE] ${moveData.name} missed! (${accuracy}% accuracy)`);
+      return {
+        player: attackerLabel,
+        type: 'attack',
+        move: moveData.name,
+        moveType: moveData.type,
+        missed: true,
+        damage: 0
+      };
+    }
+  }
+
   // --- PROTECT ---
   if (PROTECT_MOVES.includes(moveData.name)) {
     // Consecutive protect has 50% fail chance each time
@@ -867,6 +933,32 @@ function executeStatusMove(attackerLabel, attacker, defender, moveData) {
     attacker.currentHp = Math.min(maxHp, attacker.currentHp + healAmount);
     actionResult.healAmount = attacker.currentHp - oldHp;
     console.log(`[BATTLE] ${moveData.name} healed ${actionResult.healAmount} HP (${oldHp} -> ${attacker.currentHp})`);
+    return actionResult;
+  }
+
+  // --- REST (Lazy Fork) - heal 100% but fall asleep for 2 turns ---
+  if (moveData.name === 'Lazy Fork') {
+    const maxHp = attacker.maxHp || attacker.stats.hp;
+    const oldHp = attacker.currentHp;
+    attacker.currentHp = maxHp;
+    attacker.status = 'asleep';
+    attacker.sleepTurns = 2;
+    actionResult.healAmount = attacker.currentHp - oldHp;
+    actionResult.statusApplied = 'asleep';
+    console.log(`[BATTLE] Lazy Fork healed ${actionResult.healAmount} HP and fell asleep (${oldHp} -> ${attacker.currentHp})`);
+    return actionResult;
+  }
+
+  // --- TAUNT (FUD Taunt) - prevent opponent from using status moves for 3 turns ---
+  if (moveData.name === 'FUD Taunt') {
+    if (defender.taunted && defender.taunted > 0) {
+      actionResult.failed = true;
+      console.log(`[BATTLE] FUD Taunt failed - target already taunted`);
+      return actionResult;
+    }
+    defender.taunted = 3;
+    actionResult.statusApplied = 'taunted';
+    console.log(`[BATTLE] FUD Taunt applied - defender taunted for 3 turns`);
     return actionResult;
   }
 
@@ -930,6 +1022,15 @@ function processEndOfTurn(fighter) {
   const effects = [];
 
   if (!fighter || fighter.currentHp <= 0) return effects;
+
+  // Decrement taunt counter
+  if (fighter.taunted && fighter.taunted > 0) {
+    fighter.taunted--;
+    if (fighter.taunted === 0) {
+      console.log(`[BATTLE] ${fighter.name}'s taunt wore off`);
+      effects.push({ type: 'taunt_ended' });
+    }
+  }
 
   if (fighter.status === 'burned') {
     const burnDamage = Math.max(1, Math.floor(fighter.maxHp / 8));

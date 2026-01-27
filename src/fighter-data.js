@@ -93,7 +93,7 @@ const FIGHTER_DATA = [
         name: "Ruslan",
         types: ["Solid", "Airdrop"],
         stats: { hp: 334, attack: 178, defense: 416, spAttack: 86, spDefense: 177, speed: 158 },
-        moves: ["crash-down", "fud-taunt", "chill-perch", "phaze-roar"],
+        moves: ["crash-down", "fud-taunt", "chill-perch", "vault-ram"],
         spritesFront: "Sprites/Ruslan.png",
         spritesBack: "Sprites/Ruslan.png",
         spritesEnemy: "Sprites/Ruslan Enemy.png"
