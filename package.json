@@ -1,0 +1,33 @@
+{
+  "name": "cryptofighters-battle-server",
+  "version": "1.0.0",
+  "description": "WebSocket server for CryptoFighters PvP battles",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "cors": "^2.8.5",
+    "@solana/web3.js": "^1.87.0",
+    "@coral-xyz/anchor": "^0.29.0",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "keywords": [
+    "websocket",
+    "battle",
+    "pvp",
+    "solana",
+    "gaming"
+  ],
+  "author": "OnChainBattles",
+  "license": "MIT"
+}
