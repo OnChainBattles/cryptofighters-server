@@ -6,6 +6,7 @@ const cors = require('cors');
 const nacl = require('tweetnacl');
 const { PublicKey } = require('@solana/web3.js');
 const BattleManager = require('./BattleManager');
+const { validateTeam } = require('./BattleManager');
 const LobbyManager = require('./LobbyManager');
 const PlayerStorage = require('./PlayerStorage');
 
@@ -27,7 +28,7 @@ app.use(cors({
   credentials: true
 }));
 
-app.use(express.json());
+app.use(express.json({ limit: '10kb' }));
 
 const io = new Server(server, {
   cors: {
@@ -118,6 +119,18 @@ app.post('/player/:wallet', (req, res) => {
       }
     }
 
+    // M12: Sanitize displayName - max 20 chars, strip HTML, alphanumeric + spaces only
+    if (filteredSettings.displayName !== undefined) {
+      if (typeof filteredSettings.displayName !== 'string') {
+        return res.status(400).json({ error: 'displayName must be a string' });
+      }
+      filteredSettings.displayName = filteredSettings.displayName
+        .replace(/<[^>]*>/g, '')
+        .replace(/[^a-zA-Z0-9 _-]/g, '')
+        .trim()
+        .slice(0, 20);
+    }
+
     const saved = playerStorage.savePlayer(wallet, filteredSettings);
     console.log(`[STORAGE] Saved settings for ${wallet.slice(0, 8)}...`);
 
@@ -128,6 +141,22 @@ app.post('/player/:wallet', (req, res) => {
   } catch (err) {
     console.error(`[STORAGE] Error saving:`, err.message);
     res.status(500).json({ error: 'Failed to save settings' });
+  }
+});
+
+// C2: RPC proxy - hides Helius API key from client-side code
+app.post('/rpc', async (req, res) => {
+  try {
+    const response = await fetch(RPC_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body)
+    });
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error('[RPC PROXY] Error:', err.message);
+    res.status(502).json({ error: 'RPC request failed' });
   }
 });
 
@@ -192,7 +221,10 @@ io.on('connection', (socket) => {
       delete socket.authNonce;
       delete socket.pendingWallet;
 
-      // Generate session token for REST API auth
+      // Generate session token for REST API auth (delete old token first to prevent leaks)
+      if (socket.sessionToken) {
+        sessionTokens.delete(socket.sessionToken);
+      }
       const sessionToken = crypto.randomBytes(32).toString('hex');
       sessionTokens.set(sessionToken, socket.walletAddress);
       socket.sessionToken = sessionToken;
@@ -259,6 +291,21 @@ io.on('connection', (socket) => {
       return;
     }
 
+    // M11: Validate onChainLobbyId format (hex string, 64 chars)
+    if (onChainLobbyId && !/^[a-f0-9]{1,64}$/i.test(onChainLobbyId)) {
+      console.log(`[LOBBY] REJECTED: Invalid onChainLobbyId format`);
+      socket.emit('error', { message: 'Invalid on-chain lobby ID' });
+      return;
+    }
+
+    // H9: Validate team before storing (catch bad teams early, before locking wager)
+    const teamValidation = validateTeam(team);
+    if (!teamValidation.valid) {
+      console.log(`[LOBBY] REJECTED: Invalid team - ${teamValidation.error}`);
+      socket.emit('error', { message: `Invalid team: ${teamValidation.error}` });
+      return;
+    }
+
     const lobby = lobbyManager.createLobby({
       creatorWallet: socket.walletAddress,
       creatorSocketId: socket.id,
@@ -292,6 +339,14 @@ io.on('connection', (socket) => {
     if (!lobbyId || !team) {
       console.log(`[LOBBY] JOIN REJECTED: Missing data`);
       socket.emit('error', { message: 'Missing join data' });
+      return;
+    }
+
+    // H9: Validate team before joining (catch bad teams early)
+    const teamValidation = validateTeam(team);
+    if (!teamValidation.valid) {
+      console.log(`[LOBBY] JOIN REJECTED: Invalid team - ${teamValidation.error}`);
+      socket.emit('error', { message: `Invalid team: ${teamValidation.error}` });
       return;
     }
 

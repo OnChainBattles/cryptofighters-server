@@ -294,8 +294,10 @@ class Battle {
     // (faster fighter attacks first, if they KO, defender never counter-attacks)
     // This check is defensive for future features like recoil/status damage
     if (creatorEliminated && opponentEliminated) {
-      console.log('[BATTLE] UNEXPECTED: Both teams eliminated simultaneously!');
-      return this.opponent.wallet; // Fallback
+      const creatorHp = this.creator.team.reduce((sum, f) => sum + Math.max(0, f.currentHp), 0);
+      const opponentHp = this.opponent.team.reduce((sum, f) => sum + Math.max(0, f.currentHp), 0);
+      console.log(`[BATTLE] Both teams eliminated! Creator HP: ${creatorHp}, Opponent HP: ${opponentHp}`);
+      return creatorHp >= opponentHp ? this.creator.wallet : this.opponent.wallet;
     }
 
     if (creatorEliminated) {
@@ -776,8 +778,13 @@ class BattleManager {
 
     console.log(`[BATTLE] Switch timeout for ${battle.lobbyId}`);
 
-    // Auto-switch anyone who hasn't switched yet
+    // Auto-switch anyone who hasn't switched yet (clear stat stages like manual switch)
     if (battle.pendingSwitch.creatorNeedsSwitch && !battle.pendingSwitch.creatorSwitched) {
+      const outgoing = battle.creator.team[battle.creator.activeFighterIndex];
+      if (outgoing) {
+        outgoing.statStages = { attack: 0, defense: 0, spAttack: 0, spDefense: 0, speed: 0 };
+        outgoing.lastMoveWasProtect = false;
+      }
       const aliveIndex = battle.creator.team.findIndex((f, i) =>
         i !== battle.creator.activeFighterIndex && f.currentHp > 0
       );
@@ -789,6 +796,11 @@ class BattleManager {
     }
 
     if (battle.pendingSwitch.opponentNeedsSwitch && !battle.pendingSwitch.opponentSwitched) {
+      const outgoing = battle.opponent.team[battle.opponent.activeFighterIndex];
+      if (outgoing) {
+        outgoing.statStages = { attack: 0, defense: 0, spAttack: 0, spDefense: 0, speed: 0 };
+        outgoing.lastMoveWasProtect = false;
+      }
       const aliveIndex = battle.opponent.team.findIndex((f, i) =>
         i !== battle.opponent.activeFighterIndex && f.currentHp > 0
       );
@@ -833,6 +845,7 @@ class BattleManager {
     battle.pendingSwitch = null;
     battle.status = 'finished';
     battle.winner = winnerWallet;
+    battle.endedAt = Date.now();
 
     console.log(`[BATTLE] Ended: ${battle.lobbyId} - Winner: ${winnerWallet.slice(0, 8)}... (${reason})`);
 
@@ -846,10 +859,7 @@ class BattleManager {
 
     this.lobbyManager.completeLobby(battle.lobbyId);
 
-    this.settleBattleOnChain(battle).catch(err => {
-      console.error(`[SETTLEMENT] Failed for ${battle.lobbyId}:`, err.message);
-      console.log(`[SETTLEMENT] Manual settlement needed - Winner: ${winnerWallet}, Lobby: ${battle.lobbyId}`);
-    });
+    this.settleBattleWithRetry(battle, 0);
 
     setTimeout(() => {
       this.walletToBattle.delete(battle.creator.wallet);
@@ -916,31 +926,17 @@ class BattleManager {
       }
     }
 
-    // Resume turn timer if it was paused
-    if (battle.turnTimerPaused) {
-      battle.turnTimerPaused = false;
-      // DON'T call startTurn() - that resets BOTH players' pendingMove
-      // Instead restart the timer with REMAINING time, not full timer
+    // Send current state to reconnected player (timer was never paused)
+    const playerSocket = this.io.sockets.sockets.get(player.socketId);
+    if (playerSocket) {
       const elapsed = Date.now() - (battle.turnStartTime || Date.now());
-      const remaining = Math.max(5000, TURN_TIMEOUT - elapsed); // at least 5 seconds
-      battle.turnTimer = setTimeout(() => {
-        this.handleTurnTimeout(battle);
-      }, remaining);
-      const playerSocket = this.io.sockets.sockets.get(player.socketId);
-      if (playerSocket) {
-        playerSocket.emit('turn_start', {
-          turnNumber: battle.turnNumber,
-          myState: battle.getStateForPlayer(walletAddress),
-          timeLimit: remaining
-        });
-      }
-      console.log(`[BATTLE] Turn timer resumed with ${Math.round(remaining/1000)}s remaining (without resetting moves)`);
-
-      // If both moves are now ready (opponent submitted while disconnected), process immediately
-      if (battle.bothMovesReady()) {
-        clearTimeout(battle.turnTimer);
-        this.processTurn(battle);
-      }
+      const remaining = Math.max(0, TURN_TIMEOUT - elapsed);
+      playerSocket.emit('turn_start', {
+        turnNumber: battle.turnNumber,
+        myState: battle.getStateForPlayer(walletAddress),
+        timeLimit: remaining
+      });
+      console.log(`[BATTLE] Sent battle state to reconnected player (${Math.round(remaining/1000)}s remaining on turn)`);
     }
 
     return {
@@ -962,12 +958,8 @@ class BattleManager {
       player.disconnectedAt = Date.now();
       console.log(`[BATTLE] Player disconnected: ${walletAddress.slice(0, 8)}...`);
 
-      // Pause turn timer while waiting for reconnect
-      if (battle.turnTimer) {
-        clearTimeout(battle.turnTimer);
-        battle.turnTimerPaused = true;
-        console.log(`[BATTLE] Turn timer paused during disconnect`);
-      }
+      // Turn timer keeps running during disconnect - no free time for disconnecting
+      console.log(`[BATTLE] Turn timer continues running during disconnect`);
 
       // Notify opponent of disconnect (show remaining time)
       const opponent = battle.getOpponentOf(walletAddress);
@@ -1031,10 +1023,43 @@ class BattleManager {
   cleanup() {
     const now = Date.now();
     for (const [lobbyId, battle] of this.battles) {
-      if (battle.status === 'finished' && now - battle.startedAt > 60000) {
+      if (battle.status === 'finished' && now - (battle.endedAt || battle.startedAt) > 60000) {
         this.walletToBattle.delete(battle.creator.wallet);
         this.walletToBattle.delete(battle.opponent.wallet);
         this.battles.delete(lobbyId);
+      }
+    }
+  }
+
+  async settleBattleWithRetry(battle, attempt) {
+    const MAX_RETRIES = 3;
+    const RETRY_DELAYS = [5000, 15000, 45000]; // 5s, 15s, 45s
+
+    try {
+      await this.settleBattleOnChain(battle);
+      // Notify both players of successful settlement
+      this.io.to(`lobby:${battle.lobbyId}`).emit('settlement_status', {
+        status: 'confirmed',
+        message: 'Wager settled on-chain'
+      });
+    } catch (err) {
+      console.error(`[SETTLEMENT] Attempt ${attempt + 1}/${MAX_RETRIES + 1} failed for ${battle.lobbyId}:`, err.message);
+
+      if (attempt < MAX_RETRIES) {
+        const delay = RETRY_DELAYS[attempt];
+        console.log(`[SETTLEMENT] Retrying in ${delay / 1000}s...`);
+        this.io.to(`lobby:${battle.lobbyId}`).emit('settlement_status', {
+          status: 'retrying',
+          message: `Settlement pending, retrying... (attempt ${attempt + 2})`
+        });
+        setTimeout(() => this.settleBattleWithRetry(battle, attempt + 1), delay);
+      } else {
+        console.error(`[SETTLEMENT] All retries exhausted for ${battle.lobbyId}`);
+        console.log(`[SETTLEMENT] Manual settlement needed - Winner: ${battle.winner}, Lobby: ${battle.lobbyId}`);
+        this.io.to(`lobby:${battle.lobbyId}`).emit('settlement_status', {
+          status: 'failed',
+          message: 'Settlement delayed - will be processed manually'
+        });
       }
     }
   }
@@ -1101,7 +1126,7 @@ class BattleManager {
         ASSOCIATED_TOKEN_PROGRAM_ID
       );
 
-      const TREASURY_WALLET = new PublicKey('HNxESrceECsTBb89GQ1ea3N4GwaLkEQ6FZUzsC9vbqwQ');
+      const TREASURY_WALLET = new PublicKey('H4xAhKa4VB17aGDZ6uhxJMochev9hk9KrMBWWgAMhaqU');
       const [treasuryUsdc] = PublicKey.findProgramAddressSync(
         [TREASURY_WALLET.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), USDC_MINT.toBuffer()],
         ASSOCIATED_TOKEN_PROGRAM_ID
@@ -1185,3 +1210,4 @@ class BattleManager {
 }
 
 module.exports = BattleManager;
+module.exports.validateTeam = validateTeam;

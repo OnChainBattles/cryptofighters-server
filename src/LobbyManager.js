@@ -176,12 +176,22 @@ class LobbyManager {
     const lobbyId = this.walletToLobby.get(walletAddress);
     if (lobbyId) {
       const lobby = this.lobbies.get(lobbyId);
-      // Only auto-cancel if: waiting status, creator disconnected, AND no on-chain funds locked
-      // If onChainLobbyId exists, USDC is locked - don't auto-cancel or funds get stuck
-      if (lobby && lobby.status === 'waiting' && lobby.creatorWallet === walletAddress && !lobby.onChainLobbyId) {
-        this.cancelLobby(lobbyId, walletAddress);
-      } else if (lobby && lobby.onChainLobbyId) {
-        console.log(`[LOBBY] Creator disconnected but lobby ${lobbyId} has on-chain funds - keeping lobby active`);
+      if (!lobby) return;
+
+      // Don't touch lobbies with on-chain funds locked
+      if (lobby.onChainLobbyId) {
+        console.log(`[LOBBY] Player disconnected but lobby ${lobbyId} has on-chain funds - keeping lobby active`);
+        return;
+      }
+
+      // H8: Handle 'ready' zombie lobbies - both waiting and ready without on-chain funds
+      if ((lobby.status === 'waiting' && lobby.creatorWallet === walletAddress) ||
+          (lobby.status === 'ready')) {
+        console.log(`[LOBBY] Cleaning up ${lobby.status} lobby ${lobbyId} after disconnect`);
+        this.walletToLobby.delete(lobby.creatorWallet);
+        if (lobby.opponentWallet) this.walletToLobby.delete(lobby.opponentWallet);
+        lobby.status = 'cancelled';
+        this.lobbies.delete(lobbyId);
       }
     }
   }
@@ -203,9 +213,14 @@ class LobbyManager {
     const maxAge = 30 * 60 * 1000;
 
     for (const [lobbyId, lobby] of this.lobbies) {
-      if (lobby.status === 'waiting' && now - lobby.createdAt > maxAge) {
-        console.log(`[CLEANUP] Removing stale lobby: ${lobbyId}`);
+      // Skip lobbies with on-chain funds - those need on-chain cancellation
+      if (lobby.onChainLobbyId) continue;
+
+      // H8: Clean up both stale 'waiting' AND 'ready' zombie lobbies (no on-chain funds)
+      if ((lobby.status === 'waiting' || lobby.status === 'ready') && now - lobby.createdAt > maxAge) {
+        console.log(`[CLEANUP] Removing stale ${lobby.status} lobby: ${lobbyId}`);
         this.walletToLobby.delete(lobby.creatorWallet);
+        if (lobby.opponentWallet) this.walletToLobby.delete(lobby.opponentWallet);
         this.lobbies.delete(lobbyId);
       }
     }
