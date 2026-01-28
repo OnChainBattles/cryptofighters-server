@@ -1002,6 +1002,8 @@ function canMove(fighter) {
       }
       return { canMove: false, reason: 'asleep' };
     }
+    // Fallback: if sleepTurns not set but status is asleep, still block move
+    return { canMove: false, reason: 'asleep' };
   }
 
   if (fighter.status === 'frozen') {
