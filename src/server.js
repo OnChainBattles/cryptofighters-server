@@ -47,8 +47,10 @@ const playerStorage = new PlayerStorage();
 // Run lobby cleanup every 60 seconds to remove stale lobbies
 setInterval(() => lobbyManager.cleanup(), 60000);
 
-// Verified session tokens: token -> walletAddress (set on successful auth_verify)
+// Verified session tokens: token -> { wallet, createdAt } (set on successful auth_verify)
+// Tokens expire after 24 hours for security
 const sessionTokens = new Map();
+const SESSION_TOKEN_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 app.get('/', (req, res) => {
   res.json({
@@ -105,7 +107,8 @@ app.post('/player/:wallet', (req, res) => {
   // Verify session token matches the wallet
   const authHeader = req.headers.authorization;
   const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-  if (!token || sessionTokens.get(token) !== wallet) {
+  const session = token ? sessionTokens.get(token) : null;
+  if (!session || session.wallet !== wallet) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
 
@@ -197,6 +200,50 @@ io.on('connection', (socket) => {
     socket.emit('auth_challenge', { nonce });
   });
 
+  // Alternative: Client can auth with existing session token (skip signing)
+  socket.on('auth_with_token', (data) => {
+    const { token, walletAddress } = data;
+    if (!token || !walletAddress) {
+      socket.emit('auth_token_invalid');
+      return;
+    }
+
+    const session = sessionTokens.get(token);
+    if (!session || session.wallet !== walletAddress) {
+      console.log(`[AUTH] Token invalid or wallet mismatch`);
+      socket.emit('auth_token_invalid');
+      return;
+    }
+
+    // Check token expiry (24 hours)
+    if (Date.now() - session.createdAt > SESSION_TOKEN_EXPIRY_MS) {
+      console.log(`[AUTH] Token expired for ${walletAddress.slice(0, 8)}...`);
+      sessionTokens.delete(token);
+      socket.emit('auth_token_invalid');
+      return;
+    }
+
+    // Token valid! Authenticate socket
+    socket.walletAddress = walletAddress;
+    socket.sessionToken = token;
+
+    console.log(`[AUTH] Token auth OK for ${walletAddress.slice(0, 8)}...`);
+
+    // Check for active battle (same as signature auth)
+    const activeBattle = battleManager.findBattleByWallet(walletAddress);
+    if (activeBattle) {
+      const opponent = activeBattle.getOpponentWallet(walletAddress);
+      console.log(`[AUTH] Sending reconnect_available - lobby: ${activeBattle.lobbyId}`);
+      socket.emit('reconnect_available', {
+        lobbyId: activeBattle.lobbyId,
+        opponent: opponent,
+        canReconnect: true
+      });
+    }
+
+    socket.emit('authenticated', { success: true, sessionToken: token });
+  });
+
   // Step 2: Client signs the nonce with their wallet and sends signature back
   socket.on('auth_verify', (data) => {
     const { signature } = data;
@@ -231,7 +278,7 @@ io.on('connection', (socket) => {
         sessionTokens.delete(socket.sessionToken);
       }
       const sessionToken = crypto.randomBytes(32).toString('hex');
-      sessionTokens.set(sessionToken, socket.walletAddress);
+      sessionTokens.set(sessionToken, { wallet: socket.walletAddress, createdAt: Date.now() });
       socket.sessionToken = sessionToken;
 
       console.log(`[AUTH] Verified ${socket.id} = ${socket.walletAddress.slice(0, 8)}...`);
