@@ -285,9 +285,9 @@ io.on('connection', (socket) => {
       return;
     }
 
-    if (wagerAmount > 1000) {
+    if (wagerAmount > 10000) {
       console.log(`[LOBBY] REJECTED: Wager too high`);
-      socket.emit('error', { message: 'Maximum wager is 1000 USDC' });
+      socket.emit('error', { message: 'Maximum wager is 10,000 USDC' });
       return;
     }
 
