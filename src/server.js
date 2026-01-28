@@ -206,7 +206,12 @@ io.on('connection', (socket) => {
     }
 
     try {
-      const message = new TextEncoder().encode(`CryptoFighters login: ${socket.authNonce}`);
+      const message = new TextEncoder().encode(
+        `CryptoFighters Wallet Verification\n\n` +
+        `Sign this message to prove you own this wallet.\n` +
+        `This is for login only - no tokens or funds will be transferred.\n\n` +
+        `Nonce: ${socket.authNonce}`
+      );
       const sig = Uint8Array.from(Buffer.from(signature, 'base64'));
       const pubkey = new PublicKey(socket.pendingWallet).toBytes();
 
